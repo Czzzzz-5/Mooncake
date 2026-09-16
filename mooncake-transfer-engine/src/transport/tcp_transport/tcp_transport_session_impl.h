@@ -17,6 +17,8 @@
 // transport entry points and the lane scheduler independently reviewable
 // without changing linkage or lifetime behavior.
 
+#include "gpu_staging_pool.h"
+
 static size_t getChunkSize() {
     static const size_t val = [] {
         const char* env = std::getenv("MC_TCP_SLICE_SIZE");
@@ -130,6 +132,8 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         : socket_(std::move(socket)),
           validate_addr_(std::move(validate_addr)) {}
 
+    ~ServerSession() { releaseStaging(); }
+
     std::shared_ptr<tcpsocket> socket_;
     ValidateAddrFn validate_addr_;
     SessionHeader header_;
@@ -137,6 +141,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     char* local_buffer_;
     bool v2_ = false;
     uint64_t status_frame_;
+    // Pinned staging slot held while a GPU transfer uses the pool fast path.
+    GpuStagingPool::Slot* staging_slot_ = nullptr;
+
+    void releaseStaging() {
+        if (staging_slot_) {
+            GpuStagingPool::instance()->release(staging_slot_);
+            staging_slot_ = nullptr;
+        }
+    }
 
     void start() {
         total_transferred_bytes_ = 0;
@@ -211,46 +224,78 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
             // Transfer complete, wait for next request on this connection
+            releaseStaging();
             start();
             return;
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+        bool staged = false;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
-            cudaSetDevice(cuda_device);
+        if (staging_slot_) {
+            // Whole request already staged into the pinned slot; stream the
+            // remaining bytes straight from it.
+            dram_buffer = staging_slot_->buffer + total_transferred_bytes_;
+            staged = true;
+        } else {
+            cuda_device = getCudaDeviceId(addr);
+            if (cuda_device >= 0) {
+                if (total_transferred_bytes_ == 0) {
+                    // Fast path: stage the entire request with one
+                    // asynchronous ordered copy, then send from the pinned
+                    // slot. Any acquire/stage failure falls through to the
+                    // legacy per-chunk staging below.
+                    auto* pool = GpuStagingPool::instance();
+                    if (auto* slot =
+                            pool->acquire(static_cast<size_t>(size))) {
+                        if (pool->stageDeviceToHost(slot, addr,
+                                                    static_cast<size_t>(
+                                                        size))) {
+                            staging_slot_ = slot;
+                            dram_buffer = slot->buffer;
+                            staged = true;
+                        } else {
+                            pool->release(slot);
+                        }
+                    }
+                }
+                if (!staged) {
+                    dram_buffer = new char[buffer_size];
+                    cudaSetDevice(cuda_device);
 #ifdef USE_MACA
-            cudaError_t cuda_status = copyTcpCudaMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size);
+                    cudaError_t cuda_status = copyTcpCudaMemory(
+                        dram_buffer, addr + total_transferred_bytes_,
+                        buffer_size);
 #else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+                    cudaError_t cuda_status =
+                        cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                                   buffer_size, cudaMemcpyDefault);
 #endif
-            if (cuda_status != cudaSuccess) {
-                LOG(ERROR) << "ServerSession::writeBody failed to copy from "
-                              "CUDA memory. "
-                           << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
-                return;  // Connection will be closed
+                    if (cuda_status != cudaSuccess) {
+                        LOG(ERROR)
+                            << "ServerSession::writeBody failed to copy from "
+                               "CUDA memory. "
+                            << "Error: " << cudaGetErrorString(cuda_status);
+                        delete[] dram_buffer;
+                        return;  // Connection will be closed
+                    }
+                }
             }
         }
 #endif
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, staged, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0) {
+                if (cuda_device >= 0 && !staged) {
                     delete[] dram_buffer;
                 }
 #endif
@@ -280,6 +325,16 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             // acknowledge before accepting the next request — this is what
             // makes the initiator's COMPLETED mean "applied at the
             // destination" rather than "left my socket buffer".
+            if (staging_slot_) {
+                // Flush the staged payload into device memory with one
+                // asynchronous copy before acknowledging.
+                auto* pool = GpuStagingPool::instance();
+                bool ok = pool->stageHostToDevice(
+                    staging_slot_, addr, static_cast<size_t>(size));
+                pool->release(staging_slot_);
+                staging_slot_ = nullptr;
+                if (!ok) return;  // Connection will be closed
+            }
             if (v2_) {
                 sendStatus(kStatusOk, [this] { start(); });
             } else {
@@ -290,19 +345,40 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+        bool staged = false;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+        if (staging_slot_) {
+            // Receiving into the pinned slot; flushed to device memory at
+            // completion.
+            dram_buffer = staging_slot_->buffer + total_transferred_bytes_;
+            staged = true;
+        } else {
+            cuda_device = getCudaDeviceId(addr);
+            if (cuda_device >= 0) {
+                if (total_transferred_bytes_ == 0) {
+                    // Fast path: receive the whole request directly into a
+                    // pinned slot. nullptr (disabled/oversized/exhausted)
+                    // keeps the legacy per-chunk staging below.
+                    staging_slot_ = GpuStagingPool::instance()->acquire(
+                        static_cast<size_t>(size));
+                }
+                if (staging_slot_) {
+                    dram_buffer =
+                        staging_slot_->buffer + total_transferred_bytes_;
+                    staged = true;
+                } else {
+                    dram_buffer = new char[buffer_size];
+                }
+            }
         }
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, staged, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
@@ -316,14 +392,14 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ". Error: " << ec.message()
                             << " (value: " << ec.value() << ")";
                     }
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
                     return;  // Connection will be closed
                 }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0) {
+                if (cuda_device >= 0 && !staged) {
                     cudaSetDevice(cuda_device);
 #ifdef USE_MACA
                     cudaError_t cuda_status =
@@ -418,6 +494,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     bool progress_timeout_committed_ = false;
     bool terminal_reported_ = false;
     OnTerminal on_terminal_;
+    // Pinned staging slot held while a GPU transfer uses the pool fast path.
+    GpuStagingPool::Slot* staging_slot_ = nullptr;
+
+    ~ClientSession() { releaseStaging(); }
+
+    void releaseStaging() {
+        if (staging_slot_) {
+            GpuStagingPool::instance()->release(staging_slot_);
+            staging_slot_ = nullptr;
+        }
+    }
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
@@ -432,6 +519,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void cancel() noexcept {
         cancelStatusDeadline();
         cancelProgressDeadline();
+        releaseStaging();
         if (!socket_) return;
         asio::error_code cancel_ec;
         socket_->cancel(cancel_ec);
@@ -729,25 +817,60 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
+            // Whole payload received. With staged GPU data, flush it into
+            // device memory before reporting completion so that COMPLETED
+            // still means "applied at the destination".
+            if (staging_slot_) {
+                auto* pool = GpuStagingPool::instance();
+                bool ok = pool->stageHostToDevice(
+                    staging_slot_, addr, static_cast<size_t>(size));
+                pool->release(staging_slot_);
+                staging_slot_ = nullptr;
+                if (!ok) {
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+            }
             finalize(TransferStatusEnum::COMPLETED, true);
             return;
         }
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+        bool staged = false;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+        if (staging_slot_) {
+            // Receiving into the pinned slot; flushed to device memory at
+            // completion.
+            dram_buffer = staging_slot_->buffer + total_transferred_bytes_;
+            staged = true;
+        } else {
+            cuda_device = getCudaDeviceId(addr);
+            if (cuda_device >= 0) {
+                if (total_transferred_bytes_ == 0) {
+                    // Fast path: receive the whole request directly into a
+                    // pinned slot. nullptr (disabled/oversized/exhausted)
+                    // keeps the legacy per-chunk staging below.
+                    staging_slot_ = GpuStagingPool::instance()->acquire(
+                        static_cast<size_t>(size));
+                }
+                if (staging_slot_) {
+                    dram_buffer =
+                        staging_slot_->buffer + total_transferred_bytes_;
+                    staged = true;
+                } else {
+                    dram_buffer = new char[buffer_size];
+                }
+            }
         }
 #endif
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, staged, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
@@ -759,7 +882,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
 #endif
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
@@ -778,7 +901,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
 #endif
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
@@ -787,7 +910,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0) {
+                if (cuda_device >= 0 && !staged) {
                     cudaSetDevice(cuda_device);
 #ifdef USE_MACA
                     cudaError_t cuda_status =
@@ -823,6 +946,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(getChunkSize(), size - total_transferred_bytes_);
         if (buffer_size == 0) {
+            // The payload has fully entered the socket; the pinned staging
+            // slot (if any) is no longer needed.
+            releaseStaging();
             if (v2_) {
                 if (write_abort_requested_) {
                     finalize(TransferStatusEnum::FAILED, false);
@@ -850,29 +976,60 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
         char* dram_buffer = addr + total_transferred_bytes_;
         int cuda_device = -1;
+        bool staged = false;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-        cuda_device = getCudaDeviceId(addr);
-        if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
-            cudaSetDevice(cuda_device);
+        if (staging_slot_) {
+            // Whole request already staged into the pinned slot; stream the
+            // remaining bytes straight from it.
+            dram_buffer = staging_slot_->buffer + total_transferred_bytes_;
+            staged = true;
+        } else {
+            cuda_device = getCudaDeviceId(addr);
+            if (cuda_device >= 0) {
+                if (total_transferred_bytes_ == 0) {
+                    // Fast path: stage the entire request with one
+                    // asynchronous ordered copy, then send from the pinned
+                    // slot. Any acquire/stage failure falls through to the
+                    // legacy per-chunk staging below.
+                    auto* pool = GpuStagingPool::instance();
+                    if (auto* slot =
+                            pool->acquire(static_cast<size_t>(size))) {
+                        if (pool->stageDeviceToHost(slot, addr,
+                                                    static_cast<size_t>(
+                                                        size))) {
+                            staging_slot_ = slot;
+                            dram_buffer = slot->buffer;
+                            staged = true;
+                        } else {
+                            pool->release(slot);
+                        }
+                    }
+                }
+                if (!staged) {
+                    dram_buffer = new char[buffer_size];
+                    cudaSetDevice(cuda_device);
 #ifdef USE_MACA
-            cudaError_t cuda_status = copyTcpCudaMemory(
-                dram_buffer, addr + total_transferred_bytes_, buffer_size);
+                    cudaError_t cuda_status = copyTcpCudaMemory(
+                        dram_buffer, addr + total_transferred_bytes_,
+                        buffer_size);
 #else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+                    cudaError_t cuda_status =
+                        cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                                   buffer_size, cudaMemcpyDefault);
 #endif
-            if (cuda_status != cudaSuccess) {
-                LOG(ERROR) << "ClientSession::writeBody failed to copy from "
-                              "CUDA memory. "
-                           << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
-                abortWrite();
-                return;
+                    if (cuda_status != cudaSuccess) {
+                        LOG(ERROR)
+                            << "ClientSession::writeBody failed to copy from "
+                               "CUDA memory. "
+                            << "Error: " << cudaGetErrorString(cuda_status);
+                        delete[] dram_buffer;
+                        abortWrite();
+                        return;
+                    }
+                }
             }
         }
 #endif
@@ -880,12 +1037,16 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         write_body_in_flight_ = true;
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, self](
+            [this, addr, dram_buffer, cuda_device, staged, self](
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 write_body_in_flight_ = false;
-                if (cuda_device >= 0) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                if (cuda_device >= 0 && !staged) {
                     delete[] dram_buffer;
                 }
+#endif
                 if (ec) {
                     LOG(ERROR)
                         << "ClientSession::writeBody failed. "
