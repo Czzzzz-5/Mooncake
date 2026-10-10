@@ -299,6 +299,16 @@ TcpTransport::TcpTransport()
         }
     }
 
+    // Number of threads running the shared io_context. Socket I/O for all
+    // peers/lanes is handled by these threads; raise it when one core cannot
+    // sustain the aggregate transfer rate (MC_TCP_IO_THREADS, default 1 =
+    // legacy single-thread behavior).
+    const char* io_threads_env = getenv("MC_TCP_IO_THREADS");
+    if (io_threads_env) {
+        io_threads_ = parseBoundedTcpSetting("MC_TCP_IO_THREADS",
+                                             io_threads_env, 1, 1, 128);
+    }
+
     constexpr size_t kDefaultLanesPerPeer = 4;
     constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
     constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
@@ -398,7 +408,13 @@ int TcpTransport::install(std::string& local_server_name,
         std::make_shared<ConnectionLaneRuntime>(context_->io_context);
     lane_state_->runtime = lane_runtime_;
     running_ = true;
-    thread_ = std::thread(&TcpTransport::worker, this);
+    threads_.reserve(io_threads_);
+    threads_.emplace_back(&TcpTransport::worker, this);
+    for (size_t i = 1; i < io_threads_; ++i) {
+        threads_.emplace_back(&TcpTransport::runWorker, this);
+    }
+    LOG(INFO) << "TcpTransport: " << io_threads_
+              << " io thread(s), lanes_per_peer=" << lane_state_->lanes_per_peer;
     return 0;
 }
 
@@ -644,6 +660,19 @@ void TcpTransport::worker() {
         } catch (std::exception& e) {
             LOG(ERROR) << "TcpTransport::worker encountered an exception "
                           "during doAccept/run: "
+                       << e.what();
+            context_->io_context.restart();
+        }
+    }
+}
+
+void TcpTransport::runWorker() {
+    while (running_) {
+        try {
+            context_->io_context.run();
+        } catch (std::exception& e) {
+            LOG(ERROR) << "TcpTransport::runWorker encountered an exception "
+                          "during run: "
                        << e.what();
             context_->io_context.restart();
         }

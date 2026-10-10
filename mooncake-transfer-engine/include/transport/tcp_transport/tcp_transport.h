@@ -38,6 +38,9 @@
 #include <asio/io_context.hpp>
 #include <asio/ip/tcp.hpp>
 #include <asio/steady_timer.hpp>
+#include <asio/bind_executor.hpp>
+#include <asio/executor_work_guard.hpp>
+#include <asio/strand.hpp>
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -96,6 +99,8 @@ class TcpTransport : public Transport {
 
     void worker();
 
+    void runWorker();
+
     Slice *prepareTransfer(TransferTask *task, const TransferRequest &request);
 
     void startTransfer(Slice *slice,
@@ -111,7 +116,8 @@ class TcpTransport : public Transport {
    private:
     TcpContext *context_;
     std::atomic_bool running_;
-    std::thread thread_;
+    std::vector<std::thread> threads_;
+    size_t io_threads_ = 1;
     bool enable_connection_pool_ = true;
 
     // Client-side bounded work queues and fixed connection lanes.

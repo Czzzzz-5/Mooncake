@@ -19,6 +19,20 @@
 
 #include "gpu_staging_pool.h"
 
+// Debug trace for the multi-io-thread investigation (MC_TCP_DEBUG=1).
+// Gated behind a cached env lookup so the hot path stays branch-only.
+inline bool tcpTransportDebug() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("MC_TCP_DEBUG");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+#define TCP_DBG(...)                                        \
+    do {                                                    \
+        if (tcpTransportDebug()) LOG(INFO) << __VA_ARGS__;  \
+    } while (0)
+
 static size_t getChunkSize() {
     static const size_t val = [] {
         const char* env = std::getenv("MC_TCP_SLICE_SIZE");
@@ -130,11 +144,17 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     explicit ServerSession(std::shared_ptr<tcpsocket> socket,
                            ValidateAddrFn validate_addr)
         : socket_(std::move(socket)),
+          strand_(socket_->get_executor()),
           validate_addr_(std::move(validate_addr)) {}
 
     ~ServerSession() { releaseStaging(); }
 
     std::shared_ptr<tcpsocket> socket_;
+    // All handlers of a session are bound to strand_. The request chain is
+    // sequential by construction (one outstanding operation at a time), but
+    // with a shared io_context on multiple threads the strand pins initiation
+    // and state access to a single logical thread, matching ClientSession.
+    asio::strand<asio::any_io_executor> strand_;
     ValidateAddrFn validate_addr_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
@@ -161,58 +181,71 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     // closing the connection — when `next` is empty or the send fails).
     void sendStatus(uint64_t status, std::function<void()> next) {
         status_frame_ = htole64(status);
+        TCP_DBG("S sendStatus status=0x" << std::hex << status << std::dec
+                                         << " has_next=" << (bool)next);
         auto self(shared_from_this());
-        asio::async_write(*socket_,
-                          asio::buffer(&status_frame_, sizeof(status_frame_)),
-                          [this, self, next = std::move(next)](
-                              const asio::error_code& ec, std::size_t) {
-                              if (ec)
-                                  return;  // connection closes with the session
-                              if (next) next();
-                          });
+        asio::async_write(
+            *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
+            asio::bind_executor(
+                strand_,
+                [this, self, next = std::move(next)](
+                    const asio::error_code& ec, std::size_t) {
+                    if (ec)
+                        return;  // connection closes with the session
+                    if (next) next();
+                }));
     }
 
     void readHeader() {
         auto self(shared_from_this());
         asio::async_read(
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const asio::error_code& ec, std::size_t len) {
-                if (ec || len != sizeof(SessionHeader)) {
-                    if (ec.value() != asio::error::eof) {
-                        LOG(WARNING)
-                            << "ServerSession::readHeader failed. Error: "
-                            << ec.message() << " (value: " << ec.value() << ")"
-                            << ", bytes read: " << len;
+            asio::bind_executor(
+                strand_,
+                [this, self](const asio::error_code& ec, std::size_t len) {
+                    TCP_DBG("S readHeader done ec=" << ec.value()
+                                                    << " len=" << len);
+                    if (ec || len != sizeof(SessionHeader)) {
+                        if (ec.value() != asio::error::eof) {
+                            LOG(WARNING)
+                                << "ServerSession::readHeader failed. Error: "
+                                << ec.message() << " (value: " << ec.value()
+                                << ")"
+                                << ", bytes read: " << len;
+                        }
+                        return;
                     }
-                    return;
-                }
 
-                v2_ = (header_.opcode & kOpcodeV2Flag) != 0;
-                const uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
-                local_buffer_ = (char*)(le64toh(header_.addr));
-                uint64_t size = le64toh(header_.size);
-                if (validate_addr_ &&
-                    !validate_addr_((uint64_t)local_buffer_, size)) {
-                    LOG(ERROR) << "ServerSession: remote-supplied address 0x"
-                               << std::hex << (uint64_t)local_buffer_
-                               << std::dec << " with size " << size
-                               << " is not within any registered buffer";
-                    // v2 initiators learn of the rejection; v1 initiators
-                    // only see the connection close (and, for small WRITEs,
-                    // may have already reported success — the defect v2
-                    // exists to fix).
-                    if (v2_) sendStatus(kStatusAddrRejected, nullptr);
-                    return;
-                }
-                if (opcode == (uint8_t)TransferRequest::WRITE) {
-                    readBody();
-                } else if (v2_) {
-                    // READ, v2: status frame precedes the data.
-                    sendStatus(kStatusOk, [this] { writeBody(); });
-                } else {
-                    writeBody();
-                }
-            });
+                    v2_ = (header_.opcode & kOpcodeV2Flag) != 0;
+                    const uint8_t opcode = header_.opcode & ~kOpcodeV2Flag;
+                    local_buffer_ = (char*)(le64toh(header_.addr));
+                    uint64_t size = le64toh(header_.size);
+                    TCP_DBG("S readHeader opcode=" << (int)opcode
+                                                   << " v2=" << v2_
+                                                   << " size=" << size);
+                    if (validate_addr_ &&
+                        !validate_addr_((uint64_t)local_buffer_, size)) {
+                        LOG(ERROR)
+                            << "ServerSession: remote-supplied address 0x"
+                            << std::hex << (uint64_t)local_buffer_ << std::dec
+                            << " with size " << size
+                            << " is not within any registered buffer";
+                        // v2 initiators learn of the rejection; v1 initiators
+                        // only see the connection close (and, for small WRITEs,
+                        // may have already reported success — the defect v2
+                        // exists to fix).
+                        if (v2_) sendStatus(kStatusAddrRejected, nullptr);
+                        return;
+                    }
+                    if (opcode == (uint8_t)TransferRequest::WRITE) {
+                        readBody();
+                    } else if (v2_) {
+                        // READ, v2: status frame precedes the data.
+                        sendStatus(kStatusOk, [this] { writeBody(); });
+                    } else {
+                        writeBody();
+                    }
+                }));
     }
 
     void writeBody() {
@@ -290,27 +323,33 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, staged, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
+            asio::bind_executor(
+                strand_,
+                [this, addr, dram_buffer, cuda_device, staged, self](
+                    const asio::error_code& ec, std::size_t transferred_bytes) {
+                    TCP_DBG("S writeBody chunk ec=" << ec.value()
+                                                    << " bytes=" << transferred_bytes
+                                                    << " total=" << total_transferred_bytes_);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0 && !staged) {
-                    delete[] dram_buffer;
-                }
+                    if (cuda_device >= 0 && !staged) {
+                        delete[] dram_buffer;
+                    }
 #endif
-                if (ec) {
-                    LOG(ERROR)
-                        << "ServerSession::writeBody failed. "
-                        << "Attempt to write data " << static_cast<void*>(addr)
-                        << " using buffer " << static_cast<void*>(dram_buffer)
-                        << ". Error: " << ec.message()
-                        << " (value: " << ec.value() << ")";
-                    return;  // Connection will be closed
-                }
-                total_transferred_bytes_ += transferred_bytes;
-                writeBody();
-            });
+                    if (ec) {
+                        LOG(ERROR)
+                            << "ServerSession::writeBody failed. "
+                            << "Attempt to write data "
+                            << static_cast<void*>(addr) << " using buffer "
+                            << static_cast<void*>(dram_buffer)
+                            << ". Error: " << ec.message()
+                            << " (value: " << ec.value() << ")";
+                        return;  // Connection will be closed
+                    }
+                    total_transferred_bytes_ += transferred_bytes;
+                    writeBody();
+                }));
     }
 
     void readBody() {
@@ -378,52 +417,57 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, staged, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
-                if (ec) {
-                    // If client closed connection (EOF), this is normal - don't
-                    // log
-                    if (ec.value() != asio::error::eof) {
-                        LOG(WARNING)
-                            << "ServerSession::readBody failed. "
-                            << "Attempt to read data "
-                            << static_cast<void*>(addr) << " using buffer "
-                            << static_cast<void*>(dram_buffer)
-                            << ". Error: " << ec.message()
-                            << " (value: " << ec.value() << ")";
+            asio::bind_executor(
+                strand_,
+                [this, addr, dram_buffer, cuda_device, staged, self](
+                    const asio::error_code& ec, std::size_t transferred_bytes) {
+                    TCP_DBG("S readBody chunk ec=" << ec.value()
+                                                   << " bytes=" << transferred_bytes
+                                                   << " total=" << total_transferred_bytes_);
+                    if (ec) {
+                        // If client closed connection (EOF), this is normal -
+                        // don't log
+                        if (ec.value() != asio::error::eof) {
+                            LOG(WARNING)
+                                << "ServerSession::readBody failed. "
+                                << "Attempt to read data "
+                                << static_cast<void*>(addr) << " using buffer "
+                                << static_cast<void*>(dram_buffer)
+                                << ". Error: " << ec.message()
+                                << " (value: " << ec.value() << ")";
+                        }
+                        if (cuda_device >= 0 && !staged) delete[] dram_buffer;
+                        return;  // Connection will be closed
                     }
-                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
-                    return;  // Connection will be closed
-                }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0 && !staged) {
-                    cudaSetDevice(cuda_device);
+                    if (cuda_device >= 0 && !staged) {
+                        cudaSetDevice(cuda_device);
 #ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
+                        cudaError_t cuda_status =
+                            copyTcpCudaMemory(addr + total_transferred_bytes_,
+                                              dram_buffer, transferred_bytes);
 #else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                        cudaError_t cuda_status = cudaMemcpy(
+                            addr + total_transferred_bytes_, dram_buffer,
+                            transferred_bytes, cudaMemcpyDefault);
 #endif
-                    if (cuda_status != cudaSuccess) {
-                        LOG(ERROR)
-                            << "ServerSession::readBody failed to copy to CUDA "
-                               "memory. "
-                            << "Error: " << cudaGetErrorString(cuda_status);
+                        if (cuda_status != cudaSuccess) {
+                            LOG(ERROR)
+                                << "ServerSession::readBody failed to copy to "
+                                   "CUDA memory. "
+                                << "Error: " << cudaGetErrorString(cuda_status);
+                            delete[] dram_buffer;
+                            return;  // Connection will be closed
+                        }
                         delete[] dram_buffer;
-                        return;  // Connection will be closed
                     }
-                    delete[] dram_buffer;
-                }
 #endif
-                total_transferred_bytes_ += transferred_bytes;
-                readBody();
-            });
+                    total_transferred_bytes_ += transferred_bytes;
+                    readBody();
+                }));
     }
 };
 
@@ -435,10 +479,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     explicit ClientSession(std::shared_ptr<tcpsocket> socket, bool use_v2,
                            OnTerminal on_terminal)
         : socket_(std::move(socket)),
+          strand_(socket_->get_executor()),
           v2_(use_v2),
           on_terminal_(std::move(on_terminal)) {}
 
     std::shared_ptr<tcpsocket> socket_;
+    // Serializes this session's handlers (v2 WRITE runs a body-write chain and
+    // an ack read concurrently) and its timers. With one io thread this was
+    // implicit; with a shared io_context on multiple threads, concurrent
+    // socket use and session state access from different handler threads are
+    // unsafe.
+    asio::strand<asio::any_io_executor> strand_;
     SessionHeader header_;
     uint64_t total_transferred_bytes_;
     char* local_buffer_;
@@ -513,10 +564,30 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         header_.size = htole64(size);
         header_.opcode = (uint8_t)opcode | (v2_ ? kOpcodeV2Flag : 0);
         total_transferred_bytes_ = 0;
+        TCP_DBG("C initiate size=" << size << " opcode=" << (int)opcode
+                                   << " v2=" << v2_);
         writeHeader();
     }
 
     void cancel() noexcept {
+        // Called from arbitrary threads (shutdown/retirement posts and the
+        // post-join cleanup path). Route through the strand so socket and
+        // session-state access cannot race in-flight handlers; when the
+        // io_context is already stopped the posted handler never runs, and
+        // the destructor plus the shutdown path's direct socket closes cover
+        // the same cleanup.
+        try {
+            asio::post(strand_, [self = shared_from_this()] {
+                self->cancelOnStrand();
+            });
+        } catch (...) {
+            // Executor gone: no handler can be running concurrently.
+            cancelOnStrand();
+        }
+    }
+
+   private:
+    void cancelOnStrand() noexcept {
         cancelStatusDeadline();
         cancelProgressDeadline();
         releaseStaging();
@@ -528,6 +599,9 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
 
    private:
+    // The remainder of the session is driven by Asio completion handlers; all
+    // are bound to strand_ so initiation stays single-threaded per session.
+
     // The status-frame deadline is separate from the sliding progress
     // deadline below. Its expiry closes the socket, but a status completion
     // already ready in the executor queue retains its original result; the
@@ -535,7 +609,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void armStatusDeadline() {
         auto self(shared_from_this());
         status_deadline_disarmed_ = false;
-        status_timer_.emplace(socket_->get_executor());
+        status_timer_.emplace(strand_);
         status_timer_->expires_after(
             std::chrono::seconds(statusFrameTimeoutSec()));
         status_timer_->async_wait([this, self](const asio::error_code& ec) {
@@ -572,7 +646,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         ++progress_epoch_;
         if (progress_epoch_ == 0) ++progress_epoch_;
         const uint64_t progress_epoch = progress_epoch_;
-        if (!progress_timer_) progress_timer_.emplace(socket_->get_executor());
+        if (!progress_timer_) progress_timer_.emplace(strand_);
         progress_timer_->expires_after(
             std::chrono::seconds(progressTimeoutSec()));
         progress_timer_->async_wait(
@@ -593,6 +667,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
         progress_timeout_committed_ = true;
         progress_deadline_disarmed_ = true;
+        TCP_DBG("C progress deadline FIRE");
         ++progress_epoch_;
         if (progress_epoch_ == 0) ++progress_epoch_;
         if ((header_.opcode & ~kOpcodeV2Flag) ==
@@ -648,6 +723,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     void finalize(TransferStatusEnum status, bool clean) {
         if (terminal_reported_) return;
         terminal_reported_ = true;
+        TCP_DBG("C finalize status=" << (int)status << " clean=" << clean);
         cancelStatusDeadline();
         cancelProgressDeadline();
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
@@ -673,34 +749,38 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         auto self(shared_from_this());
         asio::async_write(
             *socket_, asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const asio::error_code& ec, std::size_t len) {
-                if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "ClientSession::writeHeader failed. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")"
-                        << ", bytes written: " << len;
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                if (!acceptProgress()) {
-                    if ((header_.opcode & ~kOpcodeV2Flag) ==
-                        static_cast<uint8_t>(TransferRequest::WRITE)) {
-                        abortWrite();
-                    } else {
+            asio::bind_executor(
+                strand_,
+                [this, self](const asio::error_code& ec, std::size_t len) {
+                    TCP_DBG("C writeHeader done ec=" << ec.value()
+                                                     << " len=" << len);
+                    if (ec || len != sizeof(SessionHeader)) {
+                        LOG(ERROR)
+                            << "ClientSession::writeHeader failed. Error: "
+                            << ec.message() << " (value: " << ec.value() << ")"
+                            << ", bytes written: " << len;
                         finalize(TransferStatusEnum::FAILED, false);
+                        return;
                     }
-                    return;
-                }
-                if ((header_.opcode & ~kOpcodeV2Flag) ==
-                    (uint8_t)TransferRequest::WRITE) {
-                    if (v2_) readWriteAck();  // concurrent with the body
-                    writeBody();
-                } else if (v2_) {
-                    readReadStatus();
-                } else {
-                    readBody();
-                }
-            });
+                    if (!acceptProgress()) {
+                        if ((header_.opcode & ~kOpcodeV2Flag) ==
+                            static_cast<uint8_t>(TransferRequest::WRITE)) {
+                            abortWrite();
+                        } else {
+                            finalize(TransferStatusEnum::FAILED, false);
+                        }
+                        return;
+                    }
+                    if ((header_.opcode & ~kOpcodeV2Flag) ==
+                        (uint8_t)TransferRequest::WRITE) {
+                        if (v2_) readWriteAck();  // concurrent with the body
+                        writeBody();
+                    } else if (v2_) {
+                        readReadStatus();
+                    } else {
+                        readBody();
+                    }
+                }));
         // Asio does not invoke the completion handler inline. Arm only after
         // initiation succeeds so a synchronous initiation exception cannot
         // leave a timer handler retaining this otherwise-abandoned session.
@@ -713,37 +793,39 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         armStatusDeadline();
         asio::async_read(
             *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
-            [this, self](const asio::error_code& ec, std::size_t len) {
-                cancelStatusDeadline();
-                if (ec || len != sizeof(status_frame_)) {
-                    LOG(ERROR)
-                        << "ClientSession: failed to read READ status "
-                           "frame. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")";
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                if (!acceptProgress()) {
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                uint64_t frame = le64toh(status_frame_);
-                if (!statusFrameValid(frame)) {
-                    LOG(ERROR) << "ClientSession: malformed READ status "
-                                  "frame (peer likely speaks the legacy "
-                                  "protocol); dropping connection";
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                if (frame != kStatusOk) {
-                    LOG(ERROR) << "ClientSession: READ rejected by server, "
-                                  "status "
-                               << (frame & 0xFFFFFFFFull);
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                readBody();
-            });
+            asio::bind_executor(
+                strand_,
+                [this, self](const asio::error_code& ec, std::size_t len) {
+                    cancelStatusDeadline();
+                    if (ec || len != sizeof(status_frame_)) {
+                        LOG(ERROR)
+                            << "ClientSession: failed to read READ status "
+                               "frame. Error: "
+                            << ec.message() << " (value: " << ec.value() << ")";
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    if (!acceptProgress()) {
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    uint64_t frame = le64toh(status_frame_);
+                    if (!statusFrameValid(frame)) {
+                        LOG(ERROR) << "ClientSession: malformed READ status "
+                                      "frame (peer likely speaks the legacy "
+                                      "protocol); dropping connection";
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    if (frame != kStatusOk) {
+                        LOG(ERROR) << "ClientSession: READ rejected by server, "
+                                      "status "
+                                   << (frame & 0xFFFFFFFFull);
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    readBody();
+                }));
     }
 
     // v2 WRITE: completion is the server's acknowledgment that the payload
@@ -756,57 +838,61 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         auto self(shared_from_this());
         asio::async_read(
             *socket_, asio::buffer(&status_frame_, sizeof(status_frame_)),
-            [this, self](const asio::error_code& ec, std::size_t len) {
-                cancelStatusDeadline();
-                if (ec || len != sizeof(status_frame_)) {
-                    // The body path may have already finalized a failure and
-                    // closed the socket; finalize() is idempotent (moved-from
-                    // callbacks are null-checked).
-                    if (ec != asio::error::operation_aborted) {
-                        LOG(ERROR)
-                            << "ClientSession: failed to read WRITE "
-                               "ack frame. Error: "
-                            << ec.message() << " (value: " << ec.value() << ")";
+            asio::bind_executor(
+                strand_,
+                [this, self](const asio::error_code& ec, std::size_t len) {
+                    TCP_DBG("C ack done ec=" << ec.value() << " len=" << len
+                                             << " body_done=" << write_body_done_);
+                    cancelStatusDeadline();
+                    if (ec || len != sizeof(status_frame_)) {
+                        // The body path may have already finalized a failure and
+                        // closed the socket; finalize() is idempotent (moved-from
+                        // callbacks are null-checked).
+                        if (ec != asio::error::operation_aborted) {
+                            LOG(ERROR)
+                                << "ClientSession: failed to read WRITE "
+                                   "ack frame. Error: "
+                                << ec.message() << " (value: " << ec.value() << ")";
+                        }
+                        abortWrite();
+                        return;
                     }
-                    abortWrite();
-                    return;
-                }
-                bool progress_accepted = false;
+                    bool progress_accepted = false;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
-                progress_accepted =
-                    acceptProgressForTest(kSessionWriteAckSuccess);
+                    progress_accepted =
+                        acceptProgressForTest(kSessionWriteAckSuccess);
 #else
-                progress_accepted = acceptProgress();
+                    progress_accepted = acceptProgress();
 #endif
-                if (!progress_accepted) {
-                    abortWrite();
-                    return;
-                }
-                uint64_t frame = le64toh(status_frame_);
-                if (!statusFrameValid(frame)) {
-                    LOG(ERROR) << "ClientSession: malformed WRITE ack frame "
-                                  "(peer likely speaks the legacy protocol); "
-                                  "dropping connection";
-                    abortWrite();
-                    return;
-                }
-                if (frame != kStatusOk) {
-                    LOG(ERROR) << "ClientSession: WRITE rejected by server, "
-                                  "status "
-                               << (frame & 0xFFFFFFFFull);
-                    abortWrite();
-                    return;
-                }
-                if (!write_body_done_) {
-                    // The server's ack can legitimately overtake the final
-                    // local write-completion handler (both become ready
-                    // together for small writes; the io thread may run this
-                    // handler first). Record it; the body path finalizes.
-                    write_acked_ok_ = true;
-                    return;
-                }
-                finalize(TransferStatusEnum::COMPLETED, true);
-            });
+                    if (!progress_accepted) {
+                        abortWrite();
+                        return;
+                    }
+                    uint64_t frame = le64toh(status_frame_);
+                    if (!statusFrameValid(frame)) {
+                        LOG(ERROR) << "ClientSession: malformed WRITE ack frame "
+                                      "(peer likely speaks the legacy protocol); "
+                                      "dropping connection";
+                        abortWrite();
+                        return;
+                    }
+                    if (frame != kStatusOk) {
+                        LOG(ERROR) << "ClientSession: WRITE rejected by server, "
+                                      "status "
+                                   << (frame & 0xFFFFFFFFull);
+                        abortWrite();
+                        return;
+                    }
+                    if (!write_body_done_) {
+                        // The server's ack can legitimately overtake the final
+                        // local write-completion handler (both become ready
+                        // together for small writes; the io thread may run this
+                        // handler first). Record it; the body path finalizes.
+                        write_acked_ok_ = true;
+                        return;
+                    }
+                    finalize(TransferStatusEnum::COMPLETED, true);
+                }));
     }
 
     void readBody() {
@@ -870,72 +956,77 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
         asio::async_read(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, staged, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
-                if (ec) {
-                    LOG(ERROR)
-                        << "ClientSession::readBody failed. "
-                        << "Attempt to read data " << static_cast<void*>(addr)
-                        << " using buffer " << static_cast<void*>(dram_buffer)
-                        << ". Error: " << ec.message()
-                        << " (value: " << ec.value() << ")";
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
-#endif
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-
-                bool progress_accepted = !progress_timeout_committed_;
-                if (progress_accepted && transferred_bytes > 0) {
-#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
-                    progress_accepted =
-                        acceptProgressForTest(kSessionReadBodySuccess);
-#else
-                    progress_accepted = acceptProgress();
-#endif
-                }
-                if (!progress_accepted) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                    if (cuda_device >= 0 && !staged) delete[] dram_buffer;
-#endif
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
-    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX)
-                if (cuda_device >= 0 && !staged) {
-                    cudaSetDevice(cuda_device);
-#ifdef USE_MACA
-                    cudaError_t cuda_status =
-                        copyTcpCudaMemory(addr + total_transferred_bytes_,
-                                          dram_buffer, transferred_bytes);
-#else
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-#endif
-                    if (cuda_status != cudaSuccess) {
+            asio::bind_executor(
+                strand_,
+                [this, addr, dram_buffer, cuda_device, staged, self](
+                        const asio::error_code& ec, std::size_t transferred_bytes) {
+                    TCP_DBG("C readBody chunk ec=" << ec.value()
+                                                   << " bytes=" << transferred_bytes
+                                                   << " total=" << total_transferred_bytes_);
+                    if (ec) {
                         LOG(ERROR)
-                            << "ClientSession::readBody failed to copy to CUDA "
-                               "memory. "
-                            << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
+                            << "ClientSession::readBody failed. "
+                            << "Attempt to read data " << static_cast<void*>(addr)
+                            << " using buffer " << static_cast<void*>(dram_buffer)
+                            << ". Error: " << ec.message()
+                            << " (value: " << ec.value() << ")";
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                        if (cuda_device >= 0 && !staged) delete[] dram_buffer;
+#endif
                         finalize(TransferStatusEnum::FAILED, false);
                         return;
                     }
-                    delete[] dram_buffer;
-                }
+
+                    bool progress_accepted = !progress_timeout_committed_;
+                    if (progress_accepted && transferred_bytes > 0) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                        progress_accepted =
+                            acceptProgressForTest(kSessionReadBodySuccess);
+#else
+                        progress_accepted = acceptProgress();
 #endif
-                total_transferred_bytes_ += transferred_bytes;
-                readBody();
-            });
+                    }
+                    if (!progress_accepted) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                        if (cuda_device >= 0 && !staged) delete[] dram_buffer;
+#endif
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                    if (cuda_device >= 0 && !staged) {
+                        cudaSetDevice(cuda_device);
+#ifdef USE_MACA
+                        cudaError_t cuda_status =
+                            copyTcpCudaMemory(addr + total_transferred_bytes_,
+                                              dram_buffer, transferred_bytes);
+#else
+                        cudaError_t cuda_status =
+                            cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                                       transferred_bytes, cudaMemcpyDefault);
+#endif
+                        if (cuda_status != cudaSuccess) {
+                            LOG(ERROR)
+                                << "ClientSession::readBody failed to copy to CUDA "
+                                   "memory. "
+                                << "Error: " << cudaGetErrorString(cuda_status);
+                            delete[] dram_buffer;
+                            finalize(TransferStatusEnum::FAILED, false);
+                            return;
+                        }
+                        delete[] dram_buffer;
+                    }
+#endif
+                    total_transferred_bytes_ += transferred_bytes;
+                    readBody();
+                }));
     }
 
     void writeBody() {
@@ -1037,47 +1128,54 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         write_body_in_flight_ = true;
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, cuda_device, staged, self](
-                const asio::error_code& ec, std::size_t transferred_bytes) {
-                write_body_in_flight_ = false;
+            asio::bind_executor(
+                strand_,
+                [this, addr, dram_buffer, cuda_device, staged, self](
+                        const asio::error_code& ec, std::size_t transferred_bytes) {
+                    write_body_in_flight_ = false;
+                    TCP_DBG("C writeBody chunk ec=" << ec.value()
+                                                    << " bytes=" << transferred_bytes
+                                                    << " total=" << total_transferred_bytes_);
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                if (cuda_device >= 0 && !staged) {
-                    delete[] dram_buffer;
-                }
+                    if (cuda_device >= 0 && !staged) {
+                        delete[] dram_buffer;
+                    }
 #endif
-                if (ec) {
-                    LOG(ERROR)
-                        << "ClientSession::writeBody failed. "
-                        << "Attempt to write data " << static_cast<void*>(addr)
-                        << " using buffer " << static_cast<void*>(dram_buffer)
-                        << ". Error: " << ec.message()
-                        << " (value: " << ec.value() << ")";
-                    abortWrite();
-                    return;
-                }
-                if (write_abort_requested_) {
-                    // An early ACK failure or a committed progress timeout
-                    // closed the socket while this operation still owned the
-                    // caller's source buffer. It is safe to publish failure
-                    // now that the handler has run.
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                if (transferred_bytes > 0 && !acceptProgress()) {
-                    finalize(TransferStatusEnum::FAILED, false);
-                    return;
-                }
-                total_transferred_bytes_ += transferred_bytes;
-                writeBody();
-            });
+                    if (ec) {
+                        LOG(ERROR)
+                            << "ClientSession::writeBody failed. "
+                            << "Attempt to write data " << static_cast<void*>(addr)
+                            << " using buffer " << static_cast<void*>(dram_buffer)
+                            << ". Error: " << ec.message()
+                            << " (value: " << ec.value() << ")";
+                        abortWrite();
+                        return;
+                    }
+                    if (write_abort_requested_) {
+                        // An early ACK failure or a committed progress timeout
+                        // closed the socket while this operation still owned the
+                        // caller's source buffer. It is safe to publish failure
+                        // now that the handler has run.
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    if (transferred_bytes > 0 && !acceptProgress()) {
+                        finalize(TransferStatusEnum::FAILED, false);
+                        return;
+                    }
+                    total_transferred_bytes_ += transferred_bytes;
+                    writeBody();
+                }));
     }
 };
 
 struct TcpContext {
     TcpContext(short port, ValidateAddrFn validate_addr)
-        : acceptor(io_context), validate_addr_(std::move(validate_addr)) {
+        : acceptor(io_context),
+          work_guard_(asio::make_work_guard(io_context)),
+          validate_addr_(std::move(validate_addr)) {
         std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
@@ -1120,6 +1218,13 @@ struct TcpContext {
     }
 
     asio::io_context io_context;
+    // Keeps run() blocked on the event loop even when no transfer is active.
+    // Without it, a worker thread that observes a transient work-free moment
+    // (e.g. before the first doAccept) returns from run(), after which the
+    // io_context is stopped and every subsequent run() returns immediately:
+    // the thread busy-spins and handlers posted later are never executed.
+    // Released in shutdown before io_context.stop().
+    asio::executor_work_guard<asio::io_context::executor_type> work_guard_;
     asio::ip::tcp::acceptor acceptor;
     ValidateAddrFn validate_addr_;
 };

@@ -483,6 +483,8 @@ void TcpTransport::runGroupRetirement(
 void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
                                          const ConnectionKey& key,
                                          TcpWorkItem work) {
+    TCP_DBG("ENQUEUE peer=" << logical_peer << " size="
+                            << (work.slice ? work.slice->length : 0));
     const auto state = lane_state_;
     std::shared_ptr<PeerConnectionGroup> group;
     std::optional<TcpWorkItem> rejected;
@@ -725,6 +727,8 @@ void TcpTransport::runGroupPump(
         if (!group->pump_scheduled || group->pump_epoch != pump_epoch) return;
         group->pump_scheduled = false;
         if (group->state != GroupState::OPEN) return;
+        TCP_DBG("PUMP run epoch=" << pump_epoch
+                                  << " queued=" << group->queue.size());
 
         expirePendingAdmissionsLocked(*group, std::chrono::steady_clock::now(),
                                       expired);
@@ -862,6 +866,8 @@ void TcpTransport::runGroupPump(
         startLaneConnect(group, connects[i].lane, connects[i].epoch);
     for (size_t i = 0; i < session_count; ++i)
         startLaneSession(group, sessions[i].lane, sessions[i].epoch);
+    TCP_DBG("PUMP done epoch=" << pump_epoch << " sessions=" << session_count
+                               << " connects=" << connect_count);
     failWorkItems(std::move(failed), failure_reason, group->failure_counters);
     failWorkItems(std::move(expired), WorkFailureReason::QUEUE_TIMEOUT,
                   group->failure_counters);
@@ -1154,6 +1160,8 @@ void TcpTransport::startLaneSession(
                                   lane->current->slice->tcp.dest_addr,
                                   lane->current->slice->length,
                                   lane->current->slice->opcode);
+                TCP_DBG("LANE session initiated epoch=" << epoch
+                                                        << " size=" << lane->current->slice->length);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
                 queue_depth = group->queue.size();
                 queued_bytes = group->queued_bytes;
@@ -1190,6 +1198,7 @@ void TcpTransport::handleLaneTerminal(
     std::optional<TerminalAction> action;
     std::shared_ptr<asio::ip::tcp::socket> socket_to_close;
     bool stale = false;
+    TCP_DBG("LANE terminal status=" << (int)status << " epoch=" << epoch);
     {
         std::lock_guard<std::mutex> lock(group->mutex);
         if (lane->operation_epoch != epoch || lane->state != LaneState::BUSY ||
@@ -1453,8 +1462,16 @@ void TcpTransport::shutdownConnectionLanes() {
     }
 
     running_ = false;
-    if (context_) context_->io_context.stop();
-    if (thread_.joinable()) thread_.join();
+    if (context_) {
+        // Release the work guard first so run() can return once stop() is
+        // called below; otherwise the io threads park in epoll forever.
+        context_->work_guard_.reset();
+        context_->io_context.stop();
+    }
+    for (auto& t : threads_) {
+        if (t.joinable()) t.join();
+    }
+    threads_.clear();
 
     std::deque<TcpWorkItem> deferred;
     std::vector<std::shared_ptr<ClientSession>> sessions;
