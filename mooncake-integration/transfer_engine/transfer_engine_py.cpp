@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <numeric>
 #include <fstream>
+#include <thread>
 
 #include <pybind11/stl.h>
 #include "shared_segment_py.h"
@@ -52,6 +53,10 @@
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
+
+// Header-only pinned staging pool; lives with the TCP transport sources but
+// is used here for engine-side gather (submitGatherWrite).
+#include "../../mooncake-transfer-engine/src/transport/tcp_transport/gpu_staging_pool.h"
 
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
@@ -474,6 +479,92 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(
     const std::vector<size_t>& lengths, const std::string& transport_hint) {
     return batchTransferAsync(target_hostname, buffers, peer_buffer_addresses,
                               lengths, TransferOpcode::READ, transport_hint);
+}
+
+batch_id_t TransferEnginePy::submitGatherWrite(
+    const char* target_hostname, const std::vector<uintptr_t>& gpu_segments,
+    const std::vector<size_t>& lengths, uintptr_t remote_base) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1) return 0;
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    if (gpu_segments.size() != lengths.size()) {
+        LOG(ERROR) << "gpu_segments and lengths have different size";
+        return 0;
+    }
+    size_t total_length =
+        std::accumulate(lengths.begin(), lengths.end(), (size_t)0);
+    if (total_length == 0) return 0;
+
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    auto* pool = GpuStagingPool::instance();
+    auto* slot = pool->acquire(total_length);
+    if (!slot) return 0;  // caller falls back to the per-descriptor path
+
+    std::vector<const void*> srcs(gpu_segments.size());
+    for (size_t i = 0; i < gpu_segments.size(); ++i)
+        srcs[i] = reinterpret_cast<const void*>(gpu_segments[i]);
+    if (!pool->gatherDeviceToHost(slot, srcs, lengths)) {
+        pool->release(slot);
+        return 0;
+    }
+
+    batch_id_t batch_id = engine_->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = TransferRequest::WRITE;
+    entry.length = total_length;
+    entry.source = slot->buffer;
+    entry.target_id = handle;
+    entry.target_offset = remote_base;
+    entry.advise_retry_cnt = 0;
+    Status s = engine_->submitTransfer(batch_id, {entry});
+    if (!s.ok()) {
+        engine_->freeBatchID(batch_id);
+        pool->release(slot);
+        return 0;
+    }
+
+    // The slot stays checked out until the caller releases it with
+    // releaseGatherSlot after observing a terminal status. No internal
+    // monitor: polling this batch from another thread would race the
+    // caller's transferCheckStatus, which frees the batch on completion.
+    {
+        std::lock_guard<std::mutex> guard(gather_slot_mutex_);
+        gather_slots_[batch_id] = slot;
+    }
+    return batch_id;
+#else
+    (void)remote_base;
+    return 0;  // no GPU support in this build; caller falls back
+#endif
+}
+
+void TransferEnginePy::releaseGatherSlot(batch_id_t batch_id) {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(gather_slot_mutex_);
+        auto it = gather_slots_.find(batch_id);
+        if (it != gather_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+            gather_slots_.erase(it);
+        }
+    }
+    if (slot) {
+        GpuStagingPool::instance()->release(slot);
+    }
+#else
+    (void)batch_id;
+#endif
 }
 
 int TransferEnginePy::transferSync(const char* target_hostname,
@@ -1277,6 +1368,11 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "")
+            .def("submit_gather_write", &TransferEnginePy::submitGatherWrite,
+                 py::arg("target_hostname"), py::arg("gpu_segments"),
+                 py::arg("lengths"), py::arg("remote_base"))
+            .def("release_gather_slot", &TransferEnginePy::releaseGatherSlot,
+                 py::arg("batch_id"))
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),

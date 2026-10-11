@@ -138,6 +138,47 @@ class GpuStagingPool {
         return true;
     }
 
+    // GPU -> pinned, multi-segment gather: copies each srcs[i] (sizes[i]
+    // bytes) into the slot at consecutive offsets, in order, all on the
+    // slot's non-blocking stream. Blocks until the whole gather completes.
+    // The caller must hold the slot via acquire() and guarantee the total
+    // fits the slot capacity (acquire already enforces this).
+    //
+    // Ordering: a device-wide sync orders the copies after whatever compute
+    // stream produced the source data. The caller invokes this only after
+    // the producing work has finished (vLLM: after the prefill forward), so
+    // the sync is cheap; per-stream event ordering would need the producer
+    // stream, which the engine does not know.
+    bool gatherDeviceToHost(Slot* slot, const std::vector<const void*>& srcs,
+                            const std::vector<size_t>& sizes) {
+        if (cudaSetDevice(slot->device) != cudaSuccess) {
+            LOG(ERROR) << "GpuStagingPool: cudaSetDevice failed";
+            return false;
+        }
+        cudaDeviceSynchronize();
+        size_t off = 0;
+        for (size_t i = 0; i < srcs.size(); ++i) {
+            cudaError_t err =
+                cudaMemcpyAsync(slot->buffer + off, srcs[i], sizes[i],
+                                cudaMemcpyDefault, slot->stream);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "GpuStagingPool: gather cudaMemcpyAsync failed "
+                              "at segment "
+                           << i << ": " << cudaGetErrorString(err);
+                return false;
+            }
+            off += sizes[i];
+        }
+        cudaEventRecord(slot->event, slot->stream);
+        cudaError_t err = cudaEventSynchronize(slot->event);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "GpuStagingPool: gather event sync failed: "
+                       << cudaGetErrorString(err);
+            return false;
+        }
+        return true;
+    }
+
     // pinned -> GPU. Submits one asynchronous copy on the slot stream and
     // blocks until it is applied to device memory. Callers that report
     // completion only after this returns preserve the "payload applied at the
@@ -284,6 +325,10 @@ class GpuStagingPool {
     void release(Slot*) {}
     bool stageDeviceToHost(Slot*, const void*, size_t) { return false; }
     bool stageHostToDevice(Slot*, void*, size_t) { return false; }
+    bool gatherDeviceToHost(Slot*, const std::vector<const void*>&,
+                            const std::vector<size_t>&) {
+        return false;
+    }
 };
 
 #endif
