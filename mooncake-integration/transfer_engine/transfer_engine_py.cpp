@@ -483,7 +483,7 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(
 
 batch_id_t TransferEnginePy::submitGatherWrite(
     const char* target_hostname, const std::vector<uintptr_t>& gpu_segments,
-    const std::vector<size_t>& lengths, uintptr_t remote_base) {
+    const std::vector<size_t>& lengths, uintptr_t remote_base, size_t split) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -506,6 +506,7 @@ batch_id_t TransferEnginePy::submitGatherWrite(
     if (total_length == 0) return 0;
 
 #ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    auto t0 = std::chrono::steady_clock::now();
     auto* pool = GpuStagingPool::instance();
     auto* slot = pool->acquire(total_length);
     if (!slot) return 0;  // caller falls back to the per-descriptor path
@@ -517,21 +518,48 @@ batch_id_t TransferEnginePy::submitGatherWrite(
         pool->release(slot);
         return 0;
     }
+    auto t1 = std::chrono::steady_clock::now();
 
-    batch_id_t batch_id = engine_->allocateBatchID(1);
-    TransferRequest entry;
-    entry.opcode = TransferRequest::WRITE;
-    entry.length = total_length;
-    entry.source = slot->buffer;
-    entry.target_id = handle;
-    entry.target_offset = remote_base;
-    entry.advise_retry_cnt = 0;
-    Status s = engine_->submitTransfer(batch_id, {entry});
+    // Split the staged bytes into `split` contiguous descriptors so the TCP
+    // transport spreads them across lanes. One descriptor would serialize
+    // the whole batch on a single connection. All descriptors target
+    // consecutive offsets of the same remote buffer; the consumer cannot
+    // tell the difference. The batch must be sized to the descriptor
+    // count: allocateBatchID(n) marks the batch complete after n tasks,
+    // so allocateBatchID(1) with n>1 would report completion after the
+    // first descriptor and the caller would release the slot under the
+    // remaining in-flight writes.
+    size_t n = std::max<size_t>(1, std::min(split, total_length));
+    batch_id_t batch_id = engine_->allocateBatchID(n);
+    std::vector<TransferRequest> entries;
+    entries.reserve(n);
+    size_t chunk = total_length / n;
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t len = (i + 1 == n) ? (total_length - off) : chunk;
+        TransferRequest entry;
+        entry.opcode = TransferRequest::WRITE;
+        entry.length = len;
+        entry.source = slot->buffer + off;
+        entry.target_id = handle;
+        entry.target_offset = remote_base + off;
+        entry.advise_retry_cnt = 0;
+        entries.push_back(entry);
+        off += len;
+    }
+    Status s = engine_->submitTransfer(batch_id, entries);
     if (!s.ok()) {
         engine_->freeBatchID(batch_id);
         pool->release(slot);
         return 0;
     }
+    auto t2 = std::chrono::steady_clock::now();
+    LOG(INFO) << "submitGatherWrite: gather "
+              << std::chrono::duration<double>(t1 - t0).count()
+              << " s, submit "
+              << std::chrono::duration<double>(t2 - t1).count()
+              << " s, bytes=" << total_length
+              << " segs=" << gpu_segments.size() << " descs=" << n;
 
     // The slot stays checked out until the caller releases it with
     // releaseGatherSlot after observing a terminal status. No internal
@@ -544,6 +572,7 @@ batch_id_t TransferEnginePy::submitGatherWrite(
     return batch_id;
 #else
     (void)remote_base;
+    (void)split;
     return 0;  // no GPU support in this build; caller falls back
 #endif
 }
@@ -1465,7 +1494,8 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("transport_hint") = "")
             .def("submit_gather_write", &TransferEnginePy::submitGatherWrite,
                  py::arg("target_hostname"), py::arg("gpu_segments"),
-                 py::arg("lengths"), py::arg("remote_base"))
+                 py::arg("lengths"), py::arg("remote_base"),
+                 py::arg("split") = 1)
             .def("release_gather_slot", &TransferEnginePy::releaseGatherSlot,
                  py::arg("batch_id"))
             .def("acquire_scatter_slot", &TransferEnginePy::acquireScatterSlot)

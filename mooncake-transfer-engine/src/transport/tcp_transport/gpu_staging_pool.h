@@ -156,6 +156,45 @@ class GpuStagingPool {
             return false;
         }
         cudaDeviceSynchronize();
+#if CUDART_VERSION >= 12080
+        // One batched launch for the whole gather: ~175k tiny per-block
+        // copies of a 100k-token request take ~11 s when issued one
+        // cudaMemcpyAsync at a time (launch-latency bound, ~63 us each);
+        // batched, the same 5.7 GB gather is bandwidth bound (<1 s).
+        // Destinations are consecutive non-overlapping slices of the slot,
+        // sources are distinct KV blocks, so the batch's "no ordering
+        // guarantees within the batch" is safe. Mirrors scatterHostToDevice.
+        {
+            std::vector<void*> dsts(srcs.size());
+            size_t off = 0;
+            for (size_t i = 0; i < srcs.size(); ++i) {
+                dsts[i] = slot->buffer + off;
+                off += sizes[i];
+            }
+            cudaMemcpyAttributes attrs{};
+            attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            size_t attrs_idx = 0;
+            cudaError_t err = cudaMemcpyBatchAsync(
+                dsts.data(), srcs.data(), sizes.data(), srcs.size(), &attrs,
+                &attrs_idx, 1, slot->stream);
+            if (err == cudaSuccess) {
+                cudaEventRecord(slot->event, slot->stream);
+                err = cudaEventSynchronize(slot->event);
+                if (err != cudaSuccess) {
+                    LOG(ERROR)
+                        << "GpuStagingPool: gather event sync failed: "
+                        << cudaGetErrorString(err);
+                    return false;
+                }
+                return true;
+            }
+            LOG(WARNING) << "GpuStagingPool: cudaMemcpyBatchAsync failed: "
+                         << cudaGetErrorString(err)
+                         << "; falling back to per-segment copies "
+                            "(re-copying is idempotent: same bytes, same "
+                            "destinations)";
+        }
+#endif
         size_t off = 0;
         for (size_t i = 0; i < srcs.size(); ++i) {
             cudaError_t err =
@@ -294,7 +333,7 @@ class GpuStagingPool {
             return;
         }
 
-        slot_bytes_ = parseEnvBytes("MC_TCP_GPU_STAGING_SLOT_MB", 16, 1, 1024);
+        slot_bytes_ = parseEnvBytes("MC_TCP_GPU_STAGING_SLOT_MB", 16, 1, 16384);
         size_t num_slots = parseEnvSize("MC_TCP_GPU_STAGING_SLOTS", 8, 1, 64);
 
         int device = 0;

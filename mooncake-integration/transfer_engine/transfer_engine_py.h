@@ -112,6 +112,12 @@ class TransferEnginePy {
     // Engine-side gather + write: gathers scattered GPU segments
     // (gpu_segments[i], lengths[i]) into a pinned staging slot, then pushes
     // the slot to remote_base at the target as one contiguous async WRITE.
+    // split > 1 splits that WRITE into `split` equal contiguous descriptors
+    // (target offsets remote_base + chunk boundaries) within one batch, so
+    // the TCP transport spreads them across lanes — a single multi-GB
+    // descriptor would be pinned to one lane (~2.3GB/s vs ~4.9GB/s
+    // aggregate). The remote bytes land identically either way, so the
+    // consumer needs no protocol change.
     // Returns a batch_id to poll with transferCheckStatus, or 0 on failure
     // (no slot available, gather or submit failed) — the caller is expected
     // to fall back to a per-descriptor path. The slot stays in
@@ -123,7 +129,7 @@ class TransferEnginePy {
     batch_id_t submitGatherWrite(const char *target_hostname,
                                  const std::vector<uintptr_t> &gpu_segments,
                                  const std::vector<size_t> &lengths,
-                                 uintptr_t remote_base);
+                                 uintptr_t remote_base, size_t split);
 
     // Hand the staging slot of a finished gather batch back to the pool.
     // Must be called at most once per batch, after transferCheckStatus
