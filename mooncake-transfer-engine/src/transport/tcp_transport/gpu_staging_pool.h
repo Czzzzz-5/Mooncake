@@ -179,6 +179,85 @@ class GpuStagingPool {
         return true;
     }
 
+    // pinned -> GPU, multi-segment scatter: copies the bytes sitting in the
+    // slot (read contiguously from offset 0, in order) out to dsts[i]
+    // (sizes[i] bytes each), all on the slot's non-blocking stream. Blocks
+    // until the whole scatter completes. Exact mirror of gatherDeviceToHost.
+    // The caller must hold the slot via acquire() and guarantee the slot
+    // bytes are complete (the peer's WRITE has reached a terminal status).
+    //
+    // Ordering: no device-wide sync is needed — the event sync guarantees
+    // the copies are complete, so any kernel launched afterwards (vLLM
+    // marks the request received only after this returns) observes them.
+    bool scatterHostToDevice(Slot* slot, const std::vector<void*>& dsts,
+                             const std::vector<size_t>& sizes) {
+        if (cudaSetDevice(slot->device) != cudaSuccess) {
+            LOG(ERROR) << "GpuStagingPool: cudaSetDevice failed";
+            return false;
+        }
+#if CUDART_VERSION >= 12080
+        // One batched launch for the whole scatter. Per-block payloads are
+        // a strided slice of each KV block (kv_block_len < block_len), so
+        // they cannot be coalesced into larger copies, and issuing ~10k
+        // tiny cudaMemcpyAsync one at a time is launch-latency bound
+        // (observed ~40 ms for ~10.5k segments of a 346 MB batch, vs ~6 ms
+        // for vLLM's old bulk-H2D + index_copy path). The copies are
+        // independent (non-overlapping destinations), which is exactly
+        // what the batch API requires.
+        {
+            std::vector<const void*> srcs(dsts.size());
+            size_t off = 0;
+            for (size_t i = 0; i < dsts.size(); ++i) {
+                srcs[i] = slot->buffer + off;
+                off += sizes[i];
+            }
+            cudaMemcpyAttributes attrs{};
+            attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+            size_t attrs_idx = 0;
+            cudaError_t err = cudaMemcpyBatchAsync(
+                dsts.data(), srcs.data(), sizes.data(), dsts.size(), &attrs,
+                &attrs_idx, 1, slot->stream);
+            if (err == cudaSuccess) {
+                cudaEventRecord(slot->event, slot->stream);
+                err = cudaEventSynchronize(slot->event);
+                if (err != cudaSuccess) {
+                    LOG(ERROR)
+                        << "GpuStagingPool: scatter event sync failed: "
+                        << cudaGetErrorString(err);
+                    return false;
+                }
+                return true;
+            }
+            LOG(WARNING) << "GpuStagingPool: cudaMemcpyBatchAsync failed: "
+                         << cudaGetErrorString(err)
+                         << "; falling back to per-segment copies "
+                            "(re-copying is idempotent: same bytes, same "
+                            "destinations)";
+        }
+#endif
+        size_t off = 0;
+        for (size_t i = 0; i < dsts.size(); ++i) {
+            cudaError_t err =
+                cudaMemcpyAsync(dsts[i], slot->buffer + off, sizes[i],
+                                cudaMemcpyDefault, slot->stream);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "GpuStagingPool: scatter cudaMemcpyAsync failed "
+                              "at segment "
+                           << i << ": " << cudaGetErrorString(err);
+                return false;
+            }
+            off += sizes[i];
+        }
+        cudaEventRecord(slot->event, slot->stream);
+        cudaError_t err = cudaEventSynchronize(slot->event);
+        if (err != cudaSuccess) {
+            LOG(ERROR) << "GpuStagingPool: scatter event sync failed: "
+                       << cudaGetErrorString(err);
+            return false;
+        }
+        return true;
+    }
+
     // pinned -> GPU. Submits one asynchronous copy on the slot stream and
     // blocks until it is applied to device memory. Callers that report
     // completion only after this returns preserve the "payload applied at the

@@ -567,6 +567,101 @@ void TransferEnginePy::releaseGatherSlot(batch_id_t batch_id) {
 #endif
 }
 
+std::pair<uintptr_t, size_t> TransferEnginePy::acquireScatterSlot() {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    pybind11::gil_scoped_release release;
+    auto* pool = GpuStagingPool::instance();
+    // Any free slot; the caller advertises the returned capacity and the
+    // send side bounds its batch against it, so acquiring with size 1 only
+    // means "one slot, whatever its capacity".
+    auto* slot = pool->acquire(1);
+    if (!slot) return {0, 0};
+    uintptr_t addr = reinterpret_cast<uintptr_t>(slot->buffer);
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        if (!registered_scatter_slots_.count(addr)) {
+            // Register on first checkout so the peer's WRITE can target the
+            // slot; kept registered for the process lifetime (the buffers
+            // are intentionally never freed, like the pool itself).
+            if (engine_->registerLocalMemory(slot->buffer, slot->capacity,
+                                             kWildcardLocation) != 0) {
+                LOG(ERROR) << "acquireScatterSlot: registerLocalMemory "
+                              "failed; releasing the slot";
+                pool->release(slot);
+                return {0, 0};
+            }
+            registered_scatter_slots_.insert(addr);
+        }
+        scatter_slots_[addr] = slot;
+    }
+    return {addr, slot->capacity};
+#else
+    return {0, 0};
+#endif
+}
+
+int TransferEnginePy::submitScatterToDevice(
+    uintptr_t slot_addr, const std::vector<uintptr_t>& dst_segments,
+    const std::vector<size_t>& lengths) {
+    pybind11::gil_scoped_release release;
+    if (dst_segments.size() != lengths.size()) {
+        LOG(ERROR) << "dst_segments and lengths have different size";
+        return -1;
+    }
+    size_t total_length =
+        std::accumulate(lengths.begin(), lengths.end(), (size_t)0);
+    if (total_length == 0) return -1;
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        auto it = scatter_slots_.find(slot_addr);
+        if (it != scatter_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+        }
+    }
+    if (!slot) {
+        LOG(ERROR) << "submitScatterToDevice: unknown scatter slot "
+                   << slot_addr;
+        return -1;
+    }
+    if (total_length > slot->capacity) {
+        LOG(ERROR) << "submitScatterToDevice: " << total_length
+                   << " bytes exceeds slot capacity " << slot->capacity;
+        return -1;
+    }
+    std::vector<void*> dsts(dst_segments.size());
+    for (size_t i = 0; i < dst_segments.size(); ++i)
+        dsts[i] = reinterpret_cast<void*>(dst_segments[i]);
+    return GpuStagingPool::instance()->scatterHostToDevice(slot, dsts,
+                                                           lengths)
+               ? 0
+               : -1;
+#else
+    (void)slot_addr;
+    return -1;
+#endif
+}
+
+void TransferEnginePy::releaseScatterSlot(uintptr_t slot_addr) {
+#ifdef MOONCAKE_TCP_GPU_STAGING_AVAILABLE
+    GpuStagingPool::Slot* slot = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(scatter_slot_mutex_);
+        auto it = scatter_slots_.find(slot_addr);
+        if (it != scatter_slots_.end()) {
+            slot = static_cast<GpuStagingPool::Slot*>(it->second);
+            scatter_slots_.erase(it);
+        }
+    }
+    if (slot) {
+        GpuStagingPool::instance()->release(slot);
+    }
+#else
+    (void)slot_addr;
+#endif
+}
+
 int TransferEnginePy::transferSync(const char* target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
@@ -1373,6 +1468,13 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("lengths"), py::arg("remote_base"))
             .def("release_gather_slot", &TransferEnginePy::releaseGatherSlot,
                  py::arg("batch_id"))
+            .def("acquire_scatter_slot", &TransferEnginePy::acquireScatterSlot)
+            .def("submit_scatter_to_device",
+                 &TransferEnginePy::submitScatterToDevice,
+                 py::arg("slot_addr"), py::arg("dst_segments"),
+                 py::arg("lengths"))
+            .def("release_scatter_slot", &TransferEnginePy::releaseScatterSlot,
+                 py::arg("slot_addr"))
             .def("transfer_sync", &TransferEnginePy::transferSync,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),

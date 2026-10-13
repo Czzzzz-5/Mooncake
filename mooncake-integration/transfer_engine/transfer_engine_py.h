@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <memory>
 #include <stack>
+#include <unordered_set>
 #include <vector>
 
 #include "common/base/status.h"
@@ -130,6 +131,31 @@ class TransferEnginePy {
     // still in flight (e.g. TIMEOUT) is unsafe: the session may still read
     // from the slot.
     void releaseGatherSlot(batch_id_t batch_id);
+
+    // Engine-side receive slot (the receive-side mirror of
+    // submitGatherWrite): check out a pinned staging slot for one merged
+    // remote WRITE to land in. The slot buffer is registered as local
+    // memory on first checkout so a peer can target it, and stays
+    // registered for the process lifetime. Returns (slot_addr, capacity),
+    // or (0, 0) when no slot is free — the caller then advertises addr 0
+    // and the producer falls back to per-descriptor transfers. The slot
+    // stays checked out until releaseScatterSlot.
+    std::pair<uintptr_t, size_t> acquireScatterSlot();
+
+    // Scatter the bytes sitting in scatter slot `slot_addr` out to GPU
+    // destinations: dst_segments[i] receives lengths[i] bytes, read
+    // contiguously from the slot starting at offset 0, in segment order
+    // (the exact mirror of the packing submitGatherWrite performs). Blocks
+    // until the scatter is applied to device memory. Returns 0 on success.
+    // Does not release the slot; call releaseScatterSlot when done.
+    int submitScatterToDevice(uintptr_t slot_addr,
+                              const std::vector<uintptr_t> &dst_segments,
+                              const std::vector<size_t> &lengths);
+
+    // Hand a scatter slot back to the pool. Must be called exactly once per
+    // acquireScatterSlot, after the slot bytes are no longer needed (i.e.
+    // after submitScatterToDevice returned, or the pull failed).
+    void releaseScatterSlot(uintptr_t slot_addr);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
@@ -248,6 +274,11 @@ class TransferEnginePy {
     // (stored as void* to keep GpuStagingPool out of this header).
     std::mutex gather_slot_mutex_;
     std::unordered_map<batch_id_t, void *> gather_slots_;
+    // slot buffer addr -> staging slot for checked-out scatter slots, and
+    // the set of slot buffers already registered as local memory.
+    std::mutex scatter_slot_mutex_;
+    std::unordered_map<uintptr_t, void *> scatter_slots_;
+    std::unordered_set<uintptr_t> registered_scatter_slots_;
     bool auto_discovery_;
 
     uint64_t transfer_timeout_nsec_;
