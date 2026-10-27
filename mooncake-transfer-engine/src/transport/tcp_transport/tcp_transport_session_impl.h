@@ -33,6 +33,37 @@ inline bool tcpTransportDebug() {
         if (tcpTransportDebug()) LOG(INFO) << __VA_ARGS__;  \
     } while (0)
 
+// Phase timing for the real-shape KV transfer benchmark (MC_TCP_PHASE_TIMING=1).
+// Four durations are reported per transfer, each measured between its own pair
+// of real points — none is derived from the others:
+//   MC_PH1_GATHER  : source-side GPU -> pinned staging copy (D2H)
+//   MC_PH2_NET     : first body byte handed to the socket on the source
+//                    (BEGIN) -> last body byte received on the destination
+//                    (END); the two points live in different processes but
+//                    share the host CLOCK_REALTIME epoch
+//   MC_PH3_SCATTER : destination-side pinned staging -> GPU copy (H2D)
+//   total          : measured by the caller around batch_transfer_sync_read
+// Timestamps are epoch nanoseconds (system_clock) so cross-process points on
+// one host are comparable. id is the session address, for pairing points
+// within one request.
+inline bool tcpPhaseTiming() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("MC_TCP_PHASE_TIMING");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+inline int64_t phaseNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+#define PHASE_LOG(...)                                     \
+    do {                                                   \
+        if (tcpPhaseTiming())                              \
+            LOG(INFO) << "[XDBG] " << __VA_ARGS__;         \
+    } while (0)
+
 static size_t getChunkSize() {
     static const size_t val = [] {
         const char* env = std::getenv("MC_TCP_SLICE_SIZE");
@@ -285,9 +316,15 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                     auto* pool = GpuStagingPool::instance();
                     if (auto* slot =
                             pool->acquire(static_cast<size_t>(size))) {
+                        const int64_t ph0 =
+                            tcpPhaseTiming() ? phaseNowNs() : 0;
                         if (pool->stageDeviceToHost(slot, addr,
                                                     static_cast<size_t>(
                                                         size))) {
+                            PHASE_LOG("MC_PH1_GATHER t0="
+                                      << ph0 << " t1=" << phaseNowNs()
+                                      << " bytes=" << size
+                                      << " id=" << static_cast<void*>(this));
                             staging_slot_ = slot;
                             dram_buffer = slot->buffer;
                             staged = true;
@@ -304,9 +341,16 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                         dram_buffer, addr + total_transferred_bytes_,
                         buffer_size);
 #else
+                    const int64_t ph0 = tcpPhaseTiming() ? phaseNowNs() : 0;
                     cudaError_t cuda_status =
                         cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
                                    buffer_size, cudaMemcpyDefault);
+#endif
+#ifndef USE_MACA
+                    PHASE_LOG("MC_PH1_GATHER t0="
+                              << ph0 << " t1=" << phaseNowNs()
+                              << " bytes=" << buffer_size
+                              << " id=" << static_cast<void*>(this));
 #endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
@@ -321,6 +365,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         }
 #endif
 
+        if (total_transferred_bytes_ == 0) {
+            PHASE_LOG("MC_PH2_NET_BEGIN t="
+                      << phaseNowNs() << " bytes=" << size
+                      << " id=" << static_cast<void*>(this));
+        }
         asio::async_write(
             *socket_, asio::buffer(dram_buffer, buffer_size),
             asio::bind_executor(
@@ -906,10 +955,16 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             // Whole payload received. With staged GPU data, flush it into
             // device memory before reporting completion so that COMPLETED
             // still means "applied at the destination".
+            PHASE_LOG("MC_PH2_NET_END t=" << phaseNowNs() << " bytes=" << size
+                                          << " id=" << static_cast<void*>(this));
             if (staging_slot_) {
                 auto* pool = GpuStagingPool::instance();
+                const int64_t ph0 = tcpPhaseTiming() ? phaseNowNs() : 0;
                 bool ok = pool->stageHostToDevice(
                     staging_slot_, addr, static_cast<size_t>(size));
+                PHASE_LOG("MC_PH3_SCATTER t0="
+                          << ph0 << " t1=" << phaseNowNs() << " bytes=" << size
+                          << " id=" << static_cast<void*>(this));
                 pool->release(staging_slot_);
                 staging_slot_ = nullptr;
                 if (!ok) {
@@ -1008,9 +1063,16 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                             copyTcpCudaMemory(addr + total_transferred_bytes_,
                                               dram_buffer, transferred_bytes);
 #else
+                        const int64_t ph0 = tcpPhaseTiming() ? phaseNowNs() : 0;
                         cudaError_t cuda_status =
                             cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                                        transferred_bytes, cudaMemcpyDefault);
+#endif
+#ifndef USE_MACA
+                        PHASE_LOG("MC_PH3_SCATTER t0="
+                                  << ph0 << " t1=" << phaseNowNs()
+                                  << " bytes=" << transferred_bytes
+                                  << " id=" << static_cast<void*>(this));
 #endif
                         if (cuda_status != cudaSuccess) {
                             LOG(ERROR)
